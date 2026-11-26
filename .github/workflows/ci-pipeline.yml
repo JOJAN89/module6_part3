@@ -1,0 +1,109 @@
+
+# This CI/CD workflow automatically builds and checks Docker images
+# whenever application changes are pushed to the main branch.
+# It publishes images to GitHub Container Registry with unique
+# commit SHA tags and updates Kubernetes manifests in the GitOps
+# repository so Argo CD can automatically deploy the changes.
+
+name: YMB CI-CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ymb-ci-cd
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/jojan89/module6_part3
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout application repository
+        uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Build backend image
+        run: |
+          docker build -t $IMAGE_PREFIX-backend:${{ github.sha }} ./backend
+
+      - name: Build transactions image
+        run: |
+          docker build -t $IMAGE_PREFIX-transactions:${{ github.sha }} ./transactions
+
+      - name: Build syncer image
+        run: |
+          docker build -t $IMAGE_PREFIX-syncer:${{ github.sha }} ./syncer
+
+      - name: Build student portfolio image
+        run: |
+          docker build -t $IMAGE_PREFIX-studentportfolio:${{ github.sha }} ./studentportfolio
+
+      - name: Validate Docker images
+        run: |
+          for service in backend transactions syncer studentportfolio; do
+            docker image inspect "$IMAGE_PREFIX-$service:${{ github.sha }}"
+          done
+
+      - name: Push Docker images
+        run: |
+          for service in backend transactions syncer studentportfolio; do
+            docker push "$IMAGE_PREFIX-$service:${{ github.sha }}"
+          done
+
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: JOJAN89/module6_gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          ref: main
+          path: gitops
+
+      - name: Update Kubernetes manifests
+        working-directory: gitops
+        run: |
+          set -e
+
+          sed -i "s|ghcr.io/jojan89/module6_part3-backend:[^[:space:]]*|$IMAGE_PREFIX-backend:${{ github.sha }}|g" k8s/10-backend-deployment.yaml
+
+          sed -i "s|ghcr.io/jojan89/module6_part3-transactions:[^[:space:]]*|$IMAGE_PREFIX-transactions:${{ github.sha }}|g" k8s/20-transactions-deployment.yaml
+
+          sed -i "s|ghcr.io/jojan89/module6_part3-syncer:[^[:space:]]*|$IMAGE_PREFIX-syncer:${{ github.sha }}|g" k8s/22-transactions-sync-deployment.yaml
+
+          sed -i "s|ghcr.io/jojan89/module6_part3-studentportfolio:[^[:space:]]*|$IMAGE_PREFIX-studentportfolio:${{ github.sha }}|g" k8s/30-studentportfolio-deployment.yaml
+
+          grep -r "image:" k8s
+
+      - name: Commit and push updated manifests
+        working-directory: gitops
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add k8s/
+
+          if git diff --cached --quiet; then
+            echo "No deployment changes required."
+          else
+            git commit -m "Deploy application version ${{ github.sha }}"
+            git push origin main
+          fi
